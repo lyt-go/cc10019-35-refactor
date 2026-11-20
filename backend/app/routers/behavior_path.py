@@ -6,7 +6,15 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 
 from app.schemas import ActionPayload, ActionResult
-from app.services.behavior_path import build_path_sankey, get_path_result, find_common_paths
+from app.services.behavior_path import (
+    build_path_sankey,
+    get_path_result,
+    find_common_paths,
+    preview_policy_disable,
+    get_preview,
+    verify_preview,
+    replay_preview,
+)
 from app.store import store
 
 router = APIRouter(prefix="/api/behavior-path", tags=["behavior_path"])
@@ -54,6 +62,45 @@ def result(model_id: str) -> dict[str, Any]:
 @router.get("/{model_id}/common-paths")
 def common_paths(model_id: str, min_count: int = 3) -> list[dict[str, Any]]:
     return find_common_paths(model_id, min_count)
+
+
+@router.post("/{model_id}/preview-disable")
+def preview_disable(model_id: str, payload: dict[str, Any]) -> ActionResult:
+    """预演关闭一条切割规则后会话连边的变化；失败不覆盖已发布产物。"""
+    rule = payload.get("rule") or payload.get("disabled_rule")
+    try:
+        preview = preview_policy_disable(model_id, rule)
+        return ActionResult(ok=True, message="Preview", entry=preview)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.get("/{model_id}/preview/{rule}")
+def preview_detail(model_id: str, rule: str) -> dict[str, Any]:
+    preview = get_preview(model_id, rule)
+    if preview is None:
+        raise HTTPException(status_code=404, detail="Preview not found")
+    return preview
+
+
+@router.post("/{model_id}/preview/{rule}/verify")
+def preview_verify(model_id: str, rule: str) -> ActionResult:
+    """用同一份历史事件实际重切，核对预演给出的断边变化。"""
+    try:
+        report = verify_preview(model_id, rule)
+        return ActionResult(ok=report["verified"], message="Verified", entry=report)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.post("/{model_id}/preview/{rule}/replay")
+def preview_replay(model_id: str, rule: str) -> ActionResult:
+    """历史重放：用预演留存的基准重算，核对与历史预演一致。"""
+    try:
+        report = replay_preview(model_id, rule)
+        return ActionResult(ok=report["consistent"], message="Replayed", entry=report)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 @router.post("/{entry_id}/actions")

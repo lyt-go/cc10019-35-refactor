@@ -1,11 +1,19 @@
-"""会话切割引擎：按超时阈值和跨天/跨渠道策略切割用户会话。"""
+"""会话切割引擎：按超时阈值和跨天/跨渠道策略切割用户会话。
+
+切分逻辑复用 app.services.session_cutting；本模块负责策略装载、
+结果产物发布以及可回放边界诊断数据的输出。
+"""
 from __future__ import annotations
 
 from typing import Any
-from collections import defaultdict
 
 from app.store import store
 from app.schemas import SessionResult
+from app.services.session_cutting import (
+    CuttingRules,
+    fingerprint,
+    split_event_stream,
+)
 
 
 def _generate_raw_events() -> list[dict[str, Any]]:
@@ -35,89 +43,39 @@ def _generate_raw_events() -> list[dict[str, Any]]:
     return sorted(events, key=lambda x: x["timestamp"])
 
 
-def split_sessions(strategy_id: str) -> SessionResult:
-    """执行会话切割。"""
+def _session_summary(sessions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """会话清单摘要（不含事件明细），用于边界诊断产物与回放核对。"""
+    return [
+        {
+            "session_key": s["session_key"],
+            "event_count": s["event_count"],
+            "start_time": s["start_time"],
+            "end_time": s["end_time"],
+            "duration": s["duration"],
+        }
+        for s in sessions
+    ]
+
+
+def split_sessions(strategy_id: str, events: list[dict[str, Any]] | None = None) -> SessionResult:
+    """执行会话切割，并发布可回放的边界诊断产物。"""
     strategy = store.find_by_field("session_split", "strategy_id", strategy_id)
     if strategy is None:
         raise ValueError(f"Strategy not found: {strategy_id}")
 
-    timeout_sec = strategy["timeout_sec"]
-    cross_day_policy = strategy["cross_day_policy"]
-    cross_channel_policy = strategy["cross_channel_policy"]
-    session_key = strategy["session_key"]
+    rules = CuttingRules.from_strategy(strategy)
+    if events is None:
+        events = _generate_raw_events()
 
-    events = _generate_raw_events()
-
-    # 按会话键分组
-    keyed_events: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for e in events:
-        key = e.get(session_key, e["user_id"])
-        keyed_events[key].append(e)
-
-    sessions: list[dict[str, Any]] = []
-    total_events = len(events)
-
-    for key, evts in keyed_events.items():
-        evts.sort(key=lambda x: x["timestamp"])
-        current_session: list[dict[str, Any]] = []
-        session_start = evts[0]["timestamp"] if evts else 0
-
-        for i, evt in enumerate(evts):
-            if not current_session:
-                current_session = [evt]
-                session_start = evt["timestamp"]
-                continue
-
-            prev = current_session[-1]
-            time_diff = evt["timestamp"] - prev["timestamp"]
-
-            # 超时检查
-            should_split = time_diff > timeout_sec
-
-            # 跨天检查
-            if not should_split and cross_day_policy == "split":
-                prev_day = prev["timestamp"] // 86400
-                curr_day = evt["timestamp"] // 86400
-                if prev_day != curr_day:
-                    should_split = True
-
-            # 跨渠道检查
-            if not should_split and cross_channel_policy == "split":
-                if prev.get("channel") != evt.get("channel"):
-                    should_split = True
-
-            if should_split:
-                # 保存当前会话
-                sessions.append({
-                    "session_key": key,
-                    "events": [dict(e) for e in current_session],
-                    "event_count": len(current_session),
-                    "start_time": session_start,
-                    "end_time": prev["timestamp"],
-                    "duration": prev["timestamp"] - session_start,
-                })
-                current_session = [evt]
-                session_start = evt["timestamp"]
-            else:
-                current_session.append(evt)
-
-        # 保存最后一个会话
-        if current_session:
-            sessions.append({
-                "session_key": key,
-                "events": [dict(e) for e in current_session],
-                "event_count": len(current_session),
-                "start_time": session_start,
-                "end_time": current_session[-1]["timestamp"],
-                "duration": current_session[-1]["timestamp"] - session_start,
-            })
+    outcome = split_event_stream(events, rules)
+    sessions = outcome.sessions
 
     # 计算统计
     avg_duration = sum(s["duration"] for s in sessions) / len(sessions) if sessions else 0
 
     result = SessionResult(
         strategy_id=strategy_id,
-        total_events=total_events,
+        total_events=outcome.total_events,
         session_count=len(sessions),
         avg_session_duration=round(avg_duration, 2),
         sessions=sessions[:20],  # 只返回前20个会话
@@ -125,6 +83,19 @@ def split_sessions(strategy_id: str) -> SessionResult:
 
     # 存储产物
     store.set_artifact("session_split", strategy_id, result.model_dump())
+
+    # 存储可回放的边界诊断产物：同一基准的事件 + 规则 + 逐边界判定
+    rules_snapshot = rules.to_snapshot()
+    store.set_artifact("session_boundaries", strategy_id, {
+        "strategy_id": strategy_id,
+        "rules": rules_snapshot,
+        "events": [dict(e) for e in events],
+        "boundaries": outcome.boundaries,
+        "sessions": _session_summary(sessions),
+        "session_count": len(sessions),
+        "total_events": outcome.total_events,
+        "fingerprint": fingerprint(events, rules_snapshot),
+    })
 
     # 更新状态
     store.update("session_split", strategy["id"], {
@@ -145,6 +116,42 @@ def get_session_result(strategy_id: str) -> dict[str, Any] | None:
         return result.model_dump()
     except ValueError:
         return None
+
+
+def get_boundary_diagnostics(strategy_id: str) -> dict[str, Any] | None:
+    """获取可回放的边界诊断数据（事件、规则基准 + 逐边界判定）。"""
+    artifact = store.get_artifact("session_boundaries", strategy_id)
+    if artifact:
+        return artifact
+    try:
+        split_sessions(strategy_id)
+        return store.get_artifact("session_boundaries", strategy_id)
+    except ValueError:
+        return None
+
+
+def replay_session_boundaries(strategy_id: str) -> dict[str, Any]:
+    """用诊断产物中留存的同一基准（事件 + 规则）重放切分并核对。"""
+    artifact = get_boundary_diagnostics(strategy_id)
+    if artifact is None:
+        raise ValueError(f"Strategy not found: {strategy_id}")
+
+    rules = CuttingRules.from_snapshot(artifact["rules"])
+    outcome = split_event_stream(artifact["events"], rules)
+
+    boundaries_match = outcome.boundaries == artifact["boundaries"]
+    sessions_match = _session_summary(outcome.sessions) == artifact["sessions"]
+    fingerprint_match = fingerprint(artifact["events"], artifact["rules"]) == artifact["fingerprint"]
+
+    return {
+        "strategy_id": strategy_id,
+        "consistent": boundaries_match and sessions_match and fingerprint_match,
+        "checks": {
+            "boundaries": {"match": boundaries_match, "count": len(outcome.boundaries)},
+            "sessions": {"match": sessions_match, "count": len(outcome.sessions)},
+            "fingerprint": {"match": fingerprint_match, "value": artifact["fingerprint"]},
+        },
+    }
 
 
 def resegment_with_strategy(strategy_id: str, new_timeout: int | None = None) -> SessionResult:

@@ -6,7 +6,13 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 
 from app.schemas import ActionPayload, ActionResult
-from app.services.session_split import split_sessions, get_session_result, resegment_with_strategy
+from app.services.session_split import (
+    split_sessions,
+    get_session_result,
+    get_boundary_diagnostics,
+    replay_session_boundaries,
+    resegment_with_strategy,
+)
 from app.store import store, query_filters
 
 router = APIRouter(prefix="/api/session-split", tags=["session_split"])
@@ -46,6 +52,25 @@ def result(strategy_id: str) -> dict[str, Any]:
     if res is None:
         raise HTTPException(status_code=404, detail="Result not found")
     return res
+
+
+@router.get("/{strategy_id}/boundaries")
+def boundaries(strategy_id: str) -> dict[str, Any]:
+    """可回放的边界诊断数据：同一基准的事件、规则与逐边界判定。"""
+    res = get_boundary_diagnostics(strategy_id)
+    if res is None:
+        raise HTTPException(status_code=404, detail="Boundaries not found")
+    return res
+
+
+@router.post("/{strategy_id}/replay")
+def replay(strategy_id: str) -> ActionResult:
+    """用诊断产物中的基准重放切分，核对边界与会话是否一致。"""
+    try:
+        report = replay_session_boundaries(strategy_id)
+        return ActionResult(ok=report["consistent"], message="Replayed", entry=report)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 @router.post("/{strategy_id}/resegment")
